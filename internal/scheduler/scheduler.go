@@ -1,5 +1,6 @@
-// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子 六类独立排程。
-// 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻。
+// Package scheduler 定时任务：签到 / 活跃上报 / 猫猫旅行 / token keepalive / 开学季 / 夜猫子
+// 六类整点排程，外加一条间隔驱动的「余额定期刷新」。
+// 签到成功后重新查余额，余额 > 0 的冷却账号自动解冻（解冻只归签到，余额刷新不动冷却）。
 package scheduler
 
 import (
@@ -7,11 +8,13 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/notify"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -32,6 +35,27 @@ type Config struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条同一 conversationId 内多轮上报把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int
+
+	// CreditRefreshInterval 余额刷新间隔；0 = 关闭该刷新（恢复旧行为：只在签到时刷余额）。
+	//
+	// 池子的 credits 唯一写入点是签到（每天 2 次），请求消耗从不递减，故它是一份
+	// 「上次签到时的读数」：实测最长滞后 12 小时；2026-09-27 实测滞后 5 小时，
+	// 面板显示 10933 而上游真实 5792（高估 89%，其中 Elysia 号 910 vs 224）。
+	// 面板「剩余积分」与 picker 的 credits 权重都读这份值，所以拿它做独立间隔排程。
+	// 用间隔而非整点小时（对比 CheckinHours 等）：滞后量级要压到分钟级才有意义，
+	// 整点排程做不到；也因此它不进 nextWake，由 Run 里独立的 ticker 驱动——
+	// 六类整点任务全禁用时，余额刷新仍应照常运行。
+	//
+	// 余额类告警（余额低 / 池子停摆）挂在同一轮 tick 上：它们要的正是这份新鲜读数，
+	// 且同样需要分钟级检查频率。故本项为 0 时，余额类告警也一并关闭。
+	CreditRefreshInterval time.Duration
+
+	// Notify 异常推送出口；nil = 不推送（零开销）。只推三类需要人介入的事：
+	// 签到失败、余额低、池子无法服务。
+	Notify *notify.Notifier
+	// BalanceLowPerAccount / BalanceLowTotal 余额告警阈值（0 = 不检查该项）。
+	BalanceLowPerAccount int64
+	BalanceLowTotal      int64
 
 	// CheckinDisabled 显式关闭签到排程（对应 config 的 schedule.checkin_enabled=false）。
 	// 禁用后不再有任何签到时点。旅行不再搭签到便车（已剥离为独立排程）。
@@ -91,6 +115,10 @@ func New(cfg Config) *Scheduler {
 // checkinRefreshSkew 签到前判定"token 是否临近过期"的时间窗口（10 分钟）。
 // 长时间停机/容器长期停跑后 access token 往往已过期，不先刷新则签到必然 401 白跑。
 const checkinRefreshSkew = 10 * time.Minute
+
+// creditRefreshAccountGap 余额刷新时账号之间的间隔：与 cmd/credit 的限速一致，
+// 避免同一实例连续打上游触发风控（刷新间隔本身是分钟级，这点延迟无所谓）。
+const creditRefreshAccountGap = 200 * time.Millisecond
 
 // CheckinStatus 单账号签到结果状态。
 type CheckinStatus string
@@ -191,6 +219,11 @@ func (s *Scheduler) nextWake(now time.Time) (time.Time, []taskKind) {
 
 // Run 主循环，阻塞直到 ctx 取消。
 func (s *Scheduler) Run(ctx context.Context) {
+	// 余额定期刷新独立于整点排程：间隔驱动，且六类整点任务全禁用时也要照常跑，
+	// 故不并入下面的 nextWake 循环，单独起一个 ticker goroutine。
+	if s.cfg.CreditRefreshInterval > 0 {
+		go s.runCreditRefresh(ctx)
+	}
 	for {
 		next, kinds := s.nextWake(time.Now())
 		if next.IsZero() {
@@ -210,6 +243,137 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		}
 	}
+}
+
+// runCreditRefresh 按 CreditRefreshInterval 定期刷新余额，ctx 取消即退出。
+// ticker 的首个时点在间隔之后，故启动瞬间不抢签到/keepalive 的刷新（此刻 credits
+// 刚由落盘恢复，也没有抢的必要）。
+func (s *Scheduler) runCreditRefresh(ctx context.Context) {
+	t := time.NewTicker(s.cfg.CreditRefreshInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.RunCreditRefreshNow()
+		}
+	}
+}
+
+// RunCreditRefreshNow 查一遍所有账号的上游余额并写回池子。
+//
+// 刻意用 Pool.SetCredits 而非签到那条 ReenableIfCredits：后者语义是「签到解冻」，
+// 会把冷却（until/coolKind/softStreak）一并清掉；定期刷新余额只是读数更新，
+// 不该让一个正在 429 软冷却或熔断中的账号因"查到余额还有"就被凭空放回池子。
+// 解冻仍然只归签到管（见 CheckinAll）。
+//
+// 单账号失败只记日志、继续下一个：余额查不到不是账号故障，不该中断整轮刷新，
+// 更不该影响账号状态（保持上一次读数，交由签到/keepalive 去修 token）。
+func (s *Scheduler) RunCreditRefreshNow() {
+	statuses := s.cfg.Pool.List()
+	var okN, failN, skipN int
+	var total int64
+	// fresh 只装本轮真拿到的读数：余额告警必须建立在「刚刚上游确认过」的值上，
+	// 否则刚部署/刚重启（credits 还是 state.json 里的 0 或缺省）会立刻误报。
+	fresh := make(map[string]int64, len(statuses))
+	for _, st := range statuses {
+		if st.Disabled {
+			skipN++
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil || a.AccessToken == "" {
+			skipN++
+			continue
+		}
+		// access token 已过期就不打上游：必然 401，每轮刷屏只会掩盖真问题。
+		// 补票归签到/keepalive（它们先 RefreshToken 再查），本刷新只管读数。
+		if a.NeedsRefresh(0) {
+			skipN++
+			continue
+		}
+		remain, err := s.cfg.Upstream.UserResource(a)
+		if err != nil {
+			log.Printf("credit-refresh %s: %v", logfmt.UID8(st.UID), err)
+			failN++
+			continue
+		}
+		s.cfg.Pool.SetCredits(st.UID, remain)
+		fresh[st.UID] = remain
+		total += remain
+		okN++
+		// 账号间限速：最后一号之后不必再等。
+		if okN+failN < len(statuses) {
+			time.Sleep(creditRefreshAccountGap)
+		}
+	}
+	log.Printf("credit refresh done: total=%d ok=%d fail=%d skipped=%d remain=%d",
+		len(statuses), okN, failN, skipN, total)
+	s.checkHealthAlerts(statuses, fresh, okN, failN)
+}
+
+// checkHealthAlerts 检查需要人介入的状态并推送：余额查询整体失败 / 余额低 / 池子停摆。
+//
+// 挂在余额刷新那一轮 tick 上而非 handler 热路径：既拿到了刚刷新的读数，又完全不碰
+// 请求路径（推送是旁路，不该出现在 chat 的延迟里）。去重靠 Notify 的冷却，
+// key 的粒度决定重推频率：持续状态用固定 key（冷却后仍在异常则重推一次），
+// 偶发事件在调用方带自然日（见 CheckinAll）。
+//
+// 只对 fresh（本轮上游确认过的读数）判余额，理由见 RunCreditRefreshNow 的注释。
+func (s *Scheduler) checkHealthAlerts(statuses []pool.Status, fresh map[string]int64, okN, failN int) {
+	if !s.cfg.Notify.Enabled() {
+		return
+	}
+	// 全批查询失败 = 网络/上游不通（2026-09-27 的 DNS 事故就是这个形态：签到与
+	// 余额查询同时全灭）。不与签到失败重复告警，但两者覆盖的时机不同（签到每天 2 次、
+	// 这里每轮都查），所以各自保留。
+	if okN == 0 && failN > 0 {
+		s.cfg.Notify.Send("credit_refresh_down",
+			"🚨 wb2api 余额查询全部失败",
+			fmt.Sprintf("时间：%s<br><b>%d 个账号全部查不到余额</b><br>通常是网络/DNS 或上游故障；签到与余额刷新都会同时失效。",
+				nowCST(), failN))
+	}
+	var lowTotal int64
+	var parts []string
+	for _, st := range statuses {
+		credits, ok := fresh[st.UID]
+		if !ok {
+			continue
+		}
+		lowTotal += credits
+		parts = append(parts, fmt.Sprintf("%s %d", displayName(st), credits))
+		if s.cfg.BalanceLowPerAccount > 0 && credits < s.cfg.BalanceLowPerAccount {
+			s.cfg.Notify.Send("balance_low:uid:"+st.UID,
+				fmt.Sprintf("⚠️ wb2api 余额告警：%s 剩 %d", displayName(st), credits),
+				fmt.Sprintf("账号：<b>%s</b>（%s）<br>余额：<b>%d</b>（阈值 %d）<br>时间：%s<br>余额耗尽后该号会被硬冷却到次日 04:00。",
+					displayName(st), logfmt.UID8(st.UID), credits, s.cfg.BalanceLowPerAccount, nowCST()))
+		}
+	}
+	if s.cfg.BalanceLowTotal > 0 && len(fresh) > 0 && lowTotal < s.cfg.BalanceLowTotal {
+		s.cfg.Notify.Send("balance_low:total",
+			fmt.Sprintf("⚠️ wb2api 全池余额偏低：%d", lowTotal),
+			fmt.Sprintf("全池剩余：<b>%d</b>（阈值 %d）<br>分账号：%s<br>时间：%s",
+				lowTotal, s.cfg.BalanceLowTotal, strings.Join(parts, " / "), nowCST()))
+	}
+	// 池子停摆：一个能服务的号都没有 = chat 请求会直接 503，属于必须立刻知道的事。
+	if total, healthy, cooling, disabled, _ := s.cfg.Pool.CountsDetailed(); healthy == 0 {
+		s.cfg.Notify.Send("pool_down",
+			"🚨 wb2api 池子无法服务",
+			fmt.Sprintf("时间：%s<br><b>healthy=0</b>（total=%d cooling=%d disabled=%d）<br>所有账号冷却或禁用，chat 请求将直接返回 503。",
+				nowCST(), total, cooling, disabled))
+	}
+}
+
+// nowCST 当前 CST 时刻（推送文案里的时间戳，与上游重置口径一致）。
+func nowCST() string { return time.Now().In(cstZone).Format("2006-01-02 15:04:05") }
+
+// displayName 账号展示名：昵称优先，空则回落 uid 前 8 位。
+func displayName(st pool.Status) string {
+	if st.Nickname != "" {
+		return st.Nickname
+	}
+	return logfmt.UID8(st.UID)
 }
 
 // dispatch 按任务类型分发到对应执行函数。脚本类（school/cat）失败只记 WARN、
@@ -340,7 +504,45 @@ func (s *Scheduler) CheckinAll() ([]CheckinOutcome, error) {
 	}
 	log.Printf("checkin done: total=%d ok=%d already=%d fail=%d skipped=%d",
 		len(statuses), okN, alreadyN, failN, skipN)
+	s.alertCheckinFail(out, failN)
 	return out, nil
+}
+
+// alertCheckinFail 签到有失败就推一条。
+//
+// key 带 CST 自然日 → 每天至多一条：签到每天只跑 2 次，「今天这趟没成」用日期做 key
+// 比冷却窗口更贴合语义，且第二天失败仍会照常推。
+//
+// 为什么值得单独告警：签到失败 → 当天没有回补 → 余额只减不增。2026-09-27 21:00 就是
+// 四号全因 DNS 失败，没有重试、没有告警，次日余额继续往下走且无人知晓。
+func (s *Scheduler) alertCheckinFail(out []CheckinOutcome, failN int) {
+	if failN == 0 || !s.cfg.Notify.Enabled() {
+		return
+	}
+	var lines []string
+	for _, oc := range out {
+		if oc.Status != CheckinFail {
+			continue
+		}
+		name := oc.Nickname
+		if name == "" {
+			name = logfmt.UID8(oc.UID)
+		}
+		lines = append(lines, fmt.Sprintf("<b>%s</b> %s", name, truncRunes(oc.Detail, 80)))
+	}
+	s.cfg.Notify.Send("checkin_fail:"+travelDay(time.Now()),
+		fmt.Sprintf("⚠️ wb2api 签到失败 %d/%d", failN, len(out)),
+		fmt.Sprintf("时间：%s<br>%s<br>签到失败的当天没有回补，余额只减不增。",
+			nowCST(), strings.Join(lines, "<br>")))
+}
+
+// truncRunes 按字符（非字节）截断，避免把多字节字切坏。
+func truncRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return s
+	}
+	return string(r[:n]) + "…"
 }
 
 // joinDetail 拼接多段原因，避免后一段覆盖前一段的失败信息。

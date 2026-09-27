@@ -113,3 +113,32 @@ func TestNormalizeScheduleInvalidHour(t *testing.T) {
 		}
 	}
 }
+
+// TestCreditRefreshMinutesThreeStates 余额刷新间隔的三态语义：
+//   - 缺省（DefaultSchedule）→ 10，即键缺席时刷新默认开启；
+//   - 显式 0 → 保持 0 = 关闭（恢复旧行为：只在签到时刷余额）；
+//   - 负数 → 快速失败（笔误不该被静默当成"关闭"，否则用户以为刷新在跑）。
+func TestCreditRefreshMinutesThreeStates(t *testing.T) {
+	if got := DefaultSchedule().CreditRefreshMinutes; got != 10 {
+		t.Errorf("default credit_refresh_minutes=%d want 10", got)
+	}
+
+	off := DefaultSchedule()
+	off.CreditRefreshMinutes = 0
+	if err := off.Normalize(); err != nil {
+		t.Fatalf("显式 0（关闭）不该报错: %v", err)
+	}
+	if off.CreditRefreshMinutes != 0 {
+		t.Errorf("显式 0 被改写成 %d，want 0（0 = 关闭）", off.CreditRefreshMinutes)
+	}
+
+	bad := DefaultSchedule()
+	bad.CreditRefreshMinutes = -1
+	err := bad.Normalize()
+	if err == nil {
+		t.Fatal("负数应快速失败")
+	}
+	if !strings.Contains(err.Error(), "credit_refresh_minutes") {
+		t.Errorf("error %q 应指向 schedule.credit_refresh_minutes", err.Error())
+	}
+}

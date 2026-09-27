@@ -9,11 +9,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"workbuddy2api/internal/auth"
+	"workbuddy2api/internal/notify"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/upstream"
 )
@@ -640,28 +642,28 @@ func TestCheckinAllReenablesCoolingAccount(t *testing.T) {
 // 老 CN 文件（空 domain，无 realm 键）→ cn；再次 refresh 不改变已补的标识（幂等）。
 func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 	cases := []struct {
-		name       string
-		fixture    string
-		filename   string
-		wantRealm  string
+		name      string
+		fixture   string
+		filename  string
+		wantRealm string
 	}{
 		{
-			name: "老 global 落盘补 global",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
-			filename:   "workbuddy-g1.json",
-			wantRealm:  "global",
+			name:      "老 global 落盘补 global",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai"},"account":{"uid":"g1"}}`,
+			filename:  "workbuddy-g1.json",
+			wantRealm: "global",
 		},
 		{
-			name: "老 CN 空 domain 落盘补 cn",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
-			filename:   "workbuddy-c1.json",
-			wantRealm:  "cn",
+			name:      "老 CN 空 domain 落盘补 cn",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":""},"account":{"uid":"c1"}}`,
+			filename:  "workbuddy-c1.json",
+			wantRealm: "cn",
 		},
 		{
-			name: "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
-			fixture: `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
-			filename:   "workbuddy-c2.json",
-			wantRealm:  "cn",
+			name:      "已有 realm 不被覆盖——global domain 显式 cn 保持 cn",
+			fixture:   `{"auth":{"accessToken":"old","refreshToken":"rt","expiresAt":1,"domain":"www.workbuddy.ai","realm":"cn"},"account":{"uid":"c2"}}`,
+			filename:  "workbuddy-c2.json",
+			wantRealm: "cn",
 		},
 	}
 	for _, c := range cases {
@@ -722,4 +724,308 @@ func TestRunKeepaliveBackfillsRealm(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestRunCreditRefreshNowUpdatesCreditsWithoutTouchingCooldown 余额刷新必须**只更新读数**：
+// credits 跟着上游走，但正在冷却的账号不能被顺手解冻（那是签到的语义）。
+// 这条差异是本功能刻意选 SetCredits 而非 ReenableIfCredits 的原因，改动会被这里拦住。
+func TestRunCreditRefreshNowUpdatesCreditsWithoutTouchingCooldown(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 500}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.Add(&auth.Auth{UID: "u2", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1) // 面板上的旧读数（滞后值）
+	p.SetCredits("u2", 1)
+	p.Cooldown("u2", pool.CoolSoft, time.Hour, "429 软限流")
+
+	s := New(Config{
+		Pool:     p,
+		Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+	})
+	s.RunCreditRefreshNow()
+
+	for _, uid := range []string{"u1", "u2"} {
+		st, ok := p.Status(uid)
+		if !ok {
+			t.Fatalf("%s missing", uid)
+		}
+		if st.Credits != 500 {
+			t.Errorf("%s credits=%d want 500（余额刷新未写回）", uid, st.Credits)
+		}
+	}
+	// u2 在软冷却中：余额刷新不得解冻它（签到才会）。
+	st, _ := p.Status("u2")
+	if !st.Cooling {
+		t.Errorf("u2 应仍在冷却中，余额刷新不该解冻：%+v", st)
+	}
+}
+
+// TestRunCreditRefreshSkipsExpiredToken access token 已过期的账号不打上游：
+// 必然 401，每轮刷屏只会掩盖真问题；补票归签到/keepalive。
+func TestRunCreditRefreshSkipsExpiredToken(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "no upstream call expected", 500)
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 1}) // 已过期
+	p.SetCredits("u1", 42)
+
+	s := New(Config{
+		Pool:     p,
+		Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+	})
+	s.RunCreditRefreshNow()
+
+	if n := calls.Load(); n != 0 {
+		t.Errorf("upstream calls=%d want 0（token 已过期应跳过）", n)
+	}
+	st, _ := p.Status("u1")
+	if st.Credits != 42 {
+		t.Errorf("credits=%d want 42（跳过时应保留旧读数）", st.Credits)
+	}
+}
+
+// TestRunCreditRefreshDisabledNoCalls CreditRefreshInterval=0 关闭刷新：
+// Run 期间不得产生任何余额查询（且六类任务全禁用时也不空转）。
+func TestRunCreditRefreshDisabledNoCalls(t *testing.T) {
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		http.Error(w, "no upstream call expected", 404)
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+
+	s := New(Config{
+		Pool:                  p,
+		Upstream:              &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		CreditRefreshInterval: 0, // 关闭
+		CheckinDisabled:       true,
+		TravelDisabled:        true,
+		ActivityDisabled:      true,
+		KeepaliveDisabled:     true,
+		SchoolDisabled:        true,
+		CatDisabled:           true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 250*time.Millisecond)
+	defer cancel()
+	s.Run(ctx)
+
+	if n := calls.Load(); n != 0 {
+		t.Errorf("upstream calls=%d want 0（刷新已关闭）", n)
+	}
+}
+
+// TestRunCreditRefreshTicks Run 里间隔驱动的刷新真的会跑：给个短间隔，等一轮 tick。
+func TestRunCreditRefreshTicks(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 777}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	p.SetCredits("u1", 1)
+
+	s := New(Config{
+		Pool:                  p,
+		Upstream:              &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		CreditRefreshInterval: 30 * time.Millisecond,
+		CheckinDisabled:       true,
+		TravelDisabled:        true,
+		ActivityDisabled:      true,
+		KeepaliveDisabled:     true,
+		SchoolDisabled:        true,
+		CatDisabled:           true,
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+	s.Run(ctx) // 六类整点任务全禁用，但余额刷新仍应照常运行
+
+	if st, _ := p.Status("u1"); st.Credits != 777 {
+		t.Errorf("credits=%d want 777（间隔刷新未生效）", st.Credits)
+	}
+}
+
+// fakePusher 假 pushplus：记录每次推送的 key 与标题。
+type fakePusher struct {
+	mu   sync.Mutex
+	keys []string
+}
+
+func (f *fakePusher) server() *httptest.Server {
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]string
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.mu.Lock()
+		f.keys = append(f.keys, body["title"])
+		f.mu.Unlock()
+		w.Write([]byte(`{"code":200,"msg":"发送成功"}`))
+	}))
+}
+
+func (f *fakePusher) titles() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.keys...)
+}
+
+func (f *fakePusher) has(substr string) bool {
+	for _, t := range f.titles() {
+		if strings.Contains(t, substr) {
+			return true
+		}
+	}
+	return false
+}
+
+// newNotifyScheduler 造一个「余额查询成功 + 可推送」的调度器。
+func newNotifyScheduler(t *testing.T, remain int64, lowPer, lowTotal int64) (*Scheduler, *fakePusher, *pool.Pool) {
+	t.Helper()
+	f := &fakeUpstream{resourceRemain: remain}
+	srv := f.server()
+	t.Cleanup(srv.Close)
+	push := &fakePusher{}
+	psrv := push.server()
+	t.Cleanup(psrv.Close)
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s := New(Config{
+		Pool:                 p,
+		Upstream:             &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		Notify:               notify.New(notify.Config{Token: "tok", Endpoint: psrv.URL, Cooldown: time.Hour}),
+		BalanceLowPerAccount: lowPer,
+		BalanceLowTotal:      lowTotal,
+	})
+	return s, push, p
+}
+
+// TestAlertBalanceLow 余额低于阈值推送；阈值内不推。
+func TestAlertBalanceLow(t *testing.T) {
+	s, push, _ := newNotifyScheduler(t, 100, 200, 500) // 100 < 200 且 < 500
+	s.RunCreditRefreshNow()
+
+	if !push.has("余额告警") {
+		t.Errorf("单号余额低应推送，实际 %v", push.titles())
+	}
+	if !push.has("全池余额偏低") {
+		t.Errorf("全池余额低应推送，实际 %v", push.titles())
+	}
+
+	s2, push2, _ := newNotifyScheduler(t, 9999, 200, 500) // 全部高于阈值
+	s2.RunCreditRefreshNow()
+	if len(push2.titles()) != 0 {
+		t.Errorf("余额充足不该推送，实际 %v", push2.titles())
+	}
+}
+
+// TestAlertPoolDown 一个能服务的号都没有时推送（chat 会直接 503）。
+func TestAlertPoolDown(t *testing.T) {
+	s, push, p := newNotifyScheduler(t, 9999, 0, 0)
+	p.Cooldown("u1", pool.CoolHard, time.Hour, "余额不足")
+
+	s.RunCreditRefreshNow()
+
+	if !push.has("池子无法服务") {
+		t.Errorf("healthy=0 应推送，实际 %v", push.titles())
+	}
+}
+
+// TestAlertRefreshAllFailed 全批余额查询失败（网络/DNS 形态）要推送：
+// 2026-09-27 的签到全灭就是这个形态，不能静默。
+func TestAlertRefreshAllFailed(t *testing.T) {
+	push := &fakePusher{}
+	psrv := push.server()
+	defer psrv.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", 500) // 余额查询全失败
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s := New(Config{
+		Pool:     p,
+		Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		Notify:   notify.New(notify.Config{Token: "tok", Endpoint: psrv.URL, Cooldown: time.Hour}),
+	})
+	s.RunCreditRefreshNow()
+
+	if !push.has("余额查询全部失败") {
+		t.Errorf("全批失败应推送，实际 %v", push.titles())
+	}
+}
+
+// TestAlertCheckinFail 签到有失败就推；全成功不推。
+func TestAlertCheckinFail(t *testing.T) {
+	push := &fakePusher{}
+	psrv := push.server()
+	defer psrv.Close()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "boom", 500) // daily-checkin 与 user-resource 全失败
+	}))
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", Nickname: "Elysia", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s := New(Config{
+		Pool:     p,
+		Upstream: &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		Notify:   notify.New(notify.Config{Token: "tok", Endpoint: psrv.URL, Cooldown: time.Hour}),
+	})
+	if _, err := s.CheckinAll(); err != nil {
+		t.Fatalf("CheckinAll: %v", err)
+	}
+	if !push.has("签到失败") {
+		t.Errorf("签到失败应推送，实际 %v", push.titles())
+	}
+
+	// 全成功的那次不该推（换一个成功的 upstream，标题里不该再出现签到失败）。
+	f := &fakeUpstream{resourceRemain: 9999}
+	fsrv := f.server()
+	defer fsrv.Close()
+	s2 := New(Config{
+		Pool:     p,
+		Upstream: &upstream.Client{HTTP: fsrv.Client(), ChatBaseCN: fsrv.URL, BillingBaseCN: fsrv.URL},
+		Notify:   notify.New(notify.Config{Token: "tok", Endpoint: psrv.URL, Cooldown: time.Hour}),
+	})
+	push.mu.Lock()
+	push.keys = nil
+	push.mu.Unlock()
+	if _, err := s2.CheckinAll(); err != nil {
+		t.Fatalf("CheckinAll(ok): %v", err)
+	}
+	if n := len(push.titles()); n != 0 {
+		t.Errorf("签到全成功不该推送，实际 %v", push.titles())
+	}
+}
+
+// TestAlertNilNotifierNoPanic 未配推送（Notify=nil）时各类告警路径都不得 panic。
+func TestAlertNilNotifierNoPanic(t *testing.T) {
+	f := &fakeUpstream{resourceRemain: 10}
+	srv := f.server()
+	defer srv.Close()
+
+	p := pool.New("")
+	p.Add(&auth.Auth{UID: "u1", AccessToken: "at", RefreshToken: "rt", ExpiresAt: 9999999999})
+	s := New(Config{
+		Pool:                 p,
+		Upstream:             &upstream.Client{HTTP: srv.Client(), ChatBaseCN: srv.URL, BillingBaseCN: srv.URL},
+		BalanceLowPerAccount: 200, BalanceLowTotal: 500, // 阈值照配，但 Notify 为 nil
+	})
+	s.RunCreditRefreshNow() // 余额 10 远低于阈值，但没配推送 → 静默
+	s.alertCheckinFail([]CheckinOutcome{{UID: "u1", Status: CheckinFail}}, 1)
 }

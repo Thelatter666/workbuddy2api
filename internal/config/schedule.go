@@ -38,6 +38,12 @@ type Schedule struct {
 	// ActivityReportCount 每号每次活跃上报的条数：领猫前置需 5 次对话，
 	// 默认 5 条把 chat_5 刷满；0/缺省=1 兼容旧行为。
 	ActivityReportCount int `json:"activity_report_count"`
+	// CreditRefreshMinutes 余额刷新间隔（分钟）：后台按此间隔查上游余额并写回池子。
+	//
+	// 池子的 credits 原本只在签到时刷新（每天 2 次），而请求消耗不递减它，故面板
+	// 「剩余积分」最长滞后 12 小时（2026-09-27 实测滞后 5 小时、高估 89%）。0 = 关闭
+	// 该刷新，恢复旧行为（只在签到时刷余额）。
+	CreditRefreshMinutes int `json:"credit_refresh_minutes"`
 	// 猫猫旅行已退役 travel_interval_minutes：旅行现为独立排程（travel_hours）。
 	// 旧 config 里的该键因 JSON 未知字段而自然忽略，不报错。
 }
@@ -62,10 +68,12 @@ func DefaultSchedule() Schedule {
 		SchoolEnabled:       true,
 		CatEnabled:          true,
 		ActivityReportCount: 5, // 领猫前置需 5 次对话，5 连发刷满 chat_5
+		CreditRefreshMinutes: 10,
 	}
 }
 
-// Normalize 归一化排程段：空数组/null 回落默认小时，ActivityReportCount 归一，校验小时范围。
+// Normalize 归一化排程段：空数组/null 回落默认小时，ActivityReportCount 归一，
+// 校验小时范围与余额刷新间隔。
 //
 // 空数组与 null 反序列化后覆盖掉 DefaultSchedule 的排程值（键缺席才保留），在此补齐。
 // 空 = 未配置 → 回落默认；「禁用」一律走 *_enabled=false，两者互不混淆。
@@ -95,6 +103,12 @@ func (s *Schedule) Normalize() error {
 	// 0/负数 → 1 条（兼容旧行为：每号每天 1 条上报点亮连登）。
 	if s.ActivityReportCount <= 0 {
 		s.ActivityReportCount = 1
+	}
+	// 余额刷新间隔：负数是笔误而非「关闭」，静默吞掉会让用户以为刷新在跑，
+	// 故 fail fast。0 才是显式关闭（语义与上面 ActivityReportCount 的
+	// 0→1 兼容归一不同：那里 0 有历史含义，这里没有）。
+	if s.CreditRefreshMinutes < 0 {
+		return fmt.Errorf("schedule.credit_refresh_minutes: %d 非法（需为 >= 0 的整数分钟；0 = 关闭该刷新）", s.CreditRefreshMinutes)
 	}
 	return s.validateHours()
 }
