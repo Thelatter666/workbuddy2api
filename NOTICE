@@ -1,0 +1,29 @@
+本仓库派生自 Sliverkiss/workbuddy2api
+https://github.com/Sliverkiss/workbuddy2api
+
+原项目采用 MIT License，版权归原作者所有：
+
+    Copyright (c) 2026 Sliverkiss
+
+本仓库是上述项目的派生副本（derivative work），在原项目基础上做了本地开发。
+依据 MIT License，原始版权声明与许可声明随本仓库一并保留 —— 根目录 LICENSE
+文件未作任何修改。原项目 README 亦要求：再分发（源码或二进制形式）时须保留
+原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处；
+本文件即为满足该要求而设。
+
+本仓库相对原仓库的改动（截至 2026-09-28，详见 git log）：
+
+    1. fix(pool)           台账 reset_at 不再被 omitempty 吞掉（issue #36）
+    2. feat(metrics,server) 用量看板 /dashboard 与请求统计采集（小时环/日环/跨年台账）
+    3. feat(deploy)         macOS launchd 托管（开机自启 + 崩溃重启）
+    4. feat(scheduler,notify) 余额定期刷新 + 异常推送（Pushplus 微信）
+
+原项目 README 声明的使用边界同样适用于本副本，摘要如下：
+
+    - 本项目是非官方网关，使用 CodeBuddy 账号作为上游，仅限本人授权账号、
+      本机 / 私有环境测试使用；
+    - 上游 CodeBuddy 属第三方商业产品，使用其账号做 API 网关涉及目标平台的
+      服务条款与账号封禁风险；
+    - 本项目不授予任何上游（CodeBuddy）接口或服务的权利。
+
+本仓库新增的改动由本仓库维护者贡献，同样以 MIT License 条款提供。

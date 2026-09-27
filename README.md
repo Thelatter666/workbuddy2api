@@ -280,3 +280,26 @@ curl -s http://localhost:7863/v1/chat/completions \
 - 再分发（源码或二进制形式）时，须保留原仓库的 MIT 版权声明与许可声明，并在 NOTICE 或 README 中注明原始出处 `https://github.com/Sliverkiss/workbuddy2api`
 - 本项目不授予任何上游（CodeBuddy）接口或服务的权利；使用者仍需自行遵守上游服务条款
 - 本项目的使用同时受上方**免责声明**约束；如免责声明与 MIT License 存在不一致，以免责声明为准
+
+## 派生说明
+
+本仓库派生自 [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api)，
+是一个**派生副本（derivative work）**，在原项目基础上做了本地开发。
+
+原项目采用 MIT License，版权归原作者：`Copyright (c) 2026 Sliverkiss`。根目录
+`LICENSE` 文件未作任何修改，随本仓库一并保留。原始出处与完整改动清单另见
+[NOTICE](NOTICE) —— 该文件即为满足原项目「再分发时须保留版权声明并在 NOTICE 或
+README 中注明原始出处」这一要求而设。
+
+**本副本相对原仓库新增的改动**（详见 `git log`）：
+
+| 类别 | 内容 |
+|---|---|
+| 修复 | 台账 `reset_at` 不再被 `omitempty` 吞掉（issue #36） |
+| 看板 | 用量看板 `/dashboard` 与请求统计采集（小时环 7 天 / 日环 30 天 / 跨年台账 3 年） |
+| 部署 | macOS launchd 托管（开机自启 + 崩溃重启） |
+| 告警 | 余额定期刷新 + 异常推送（Pushplus 推微信） |
+
+原项目 README 声明的使用边界同样适用于本副本：本项目是**非官方**网关，仅限
+**本人授权账号、本机 / 私有环境测试**使用；不授予任何上游（CodeBuddy）接口或
+服务的权利。
