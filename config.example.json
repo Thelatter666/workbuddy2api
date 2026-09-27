@@ -6,6 +6,19 @@
   "server": {
     "max_body_mb": 8
   },
+  "dashboard": {
+    "enabled": true,
+    "refresh_seconds": 10,
+    "metrics_file": "./data/metrics.json",
+    "ledger_file": "./data/metrics_ledger.json"
+  },
+  "notify": {
+    "enabled": false,
+    "token": "",
+    "cooldown_hours": 6,
+    "balance_low_per_account": 200,
+    "balance_low_total": 500
+  },
   "cooldown": {
     "soft_rate": "600s",
     "soft_rate_max": "2h"
@@ -22,7 +35,8 @@
     "activity_enabled": true,
     "keepalive_enabled": true,
     "school_enabled": true,
-    "cat_enabled": true
+    "cat_enabled": true,
+    "credit_refresh_minutes": 10
   },
   "global": {
     "enabled": true,

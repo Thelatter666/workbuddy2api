@@ -28,6 +28,44 @@ type Config struct {
 		MaxBodyMB int `json:"max_body_mb"`
 	} `json:"server"`
 
+	// Dashboard 统计面板（/dashboard + /api/dashboard）。
+	// 缺省开启：面板外壳不含数据，数据端点 /api/dashboard 与 /status 同鉴权口径。
+	Dashboard struct {
+		// Enabled 是否注册面板路由。JSON 缺省键时保持 Default() 的 true
+		// （Unmarshal 覆写零值，故 false 需显式写出）；显式 false → 不注册，404。
+		Enabled bool `json:"enabled"`
+		// RefreshSeconds 面板自动刷新间隔（秒），默认 10；<=0 回落默认。
+		RefreshSeconds int `json:"refresh_seconds"`
+		// MetricsFile 统计历史的落盘路径（默认 ./data/metrics.json）。
+		// 只持久化小时/日两个滚动窗口（7 天 / 30 天），进程累计保持重启清零；
+		// 空字符串 = 不落盘（纯内存，重启即丢）。
+		MetricsFile string `json:"metrics_file"`
+		// LedgerFile 长期日台账落盘路径（默认 ./data/metrics_ledger.json）。
+		// 日环只有 30 槽，跨年的用量/积分消耗靠台账沉淀（保留 3 年，每天至多写一次，
+		// 与 5s 一次的热数据分文件，避免长期保留放大热路径写盘量）。
+		// 空字符串 = 不落台账（长期图表只剩日环覆盖的 30 天）。
+		LedgerFile string `json:"ledger_file"`
+	} `json:"dashboard"`
+
+	// Notify 异常推送（Pushplus）：把余额低 / 签到失败 / 池子停摆推到微信。
+	//
+	// 为什么需要它：面板是拉取式的，只在有人打开浏览器的那一刻才有意义；而这三类
+	// 异常的本质恰恰是「人没在看的时候发生了」。缺省**关闭**（token 为空即空操作）：
+	// 推送要有出口才成立，不该替用户默认打开。
+	Notify struct {
+		// Enabled 是否启用推送；需同时配 Token，二者缺一即空操作。
+		Enabled bool `json:"enabled"`
+		// Token Pushplus token；空 = 空操作（不发任何请求）。
+		Token string `json:"token"`
+		// CooldownHours 同一告警的重推冷却（小时），默认 6。
+		// 余额低是持续状态而检查是每 10 分钟一轮，没有冷却会变成 144 条/天。
+		CooldownHours int `json:"cooldown_hours"`
+		// BalanceLowPerAccount 单账号余额低于该值告警；<=0 = 不检查该项。
+		BalanceLowPerAccount int64 `json:"balance_low_per_account"`
+		// BalanceLowTotal 全池余额合计低于该值告警；<=0 = 不检查该项。
+		BalanceLowTotal int64 `json:"balance_low_total"`
+	} `json:"notify"`
+
 	Cooldown struct {
 		// hard_credit / err_threshold / err_cooldown 三个历史键已退役：
 		// 硬冷却固定为次日 04:00（CooldownUntilTomorrow4AM），连续错误语义并入熔断器。
@@ -147,6 +185,10 @@ func Default() *Config {
 	c.Cooldown.SoftRate = "600s"
 	c.Cooldown.SoftRateMax = "2h"
 	c.Server.MaxBodyMB = 8 // 请求体上限默认 8MB
+	c.Dashboard.Enabled = true
+	c.Dashboard.RefreshSeconds = 10
+	c.Dashboard.MetricsFile = "./data/metrics.json"
+	c.Dashboard.LedgerFile = "./data/metrics_ledger.json"
 	// 排程段默认值由 internal/config 集中维护（cmd/server 与 cmd/activity 共用，
 	// 消除 issue #49 的默认值漂移）。
 	c.Schedule = config.DefaultSchedule()
@@ -168,6 +210,13 @@ func Default() *Config {
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
+	// Notify 缺省关闭：token 为空即空操作，不替用户默认打开推送出口。
+	c.Notify.Enabled = false
+	c.Notify.CooldownHours = 6
+	// 阈值给一组保守默认：单号 200 / 全池 500 都远小于一次满额（万级），
+	// 触发时确实该有人看一眼。<=0 仍可显式关闭单项检查。
+	c.Notify.BalanceLowPerAccount = 200
+	c.Notify.BalanceLowTotal = 500
 	return c
 }
 
@@ -202,6 +251,22 @@ func applyEnv(c *Config) {
 	}
 	if v := os.Getenv("WB2A_STATE_FILE"); v != "" {
 		c.StateFile = v
+	}
+	// WB2A_METRICS_FILE：非空时覆盖统计历史落盘路径。
+	// 注意本模式与既有 env 一致（非空才生效），故 env 无法表达"关闭落盘"——
+	// 需要关闭时用配置文件里 dashboard.metrics_file="" 显式置空。
+	if v := os.Getenv("WB2A_METRICS_FILE"); v != "" {
+		c.Dashboard.MetricsFile = v
+	}
+	// WB2A_LEDGER_FILE：非空时覆盖长期台账落盘路径（口径同上，关闭需走配置文件）。
+	if v := os.Getenv("WB2A_LEDGER_FILE"); v != "" {
+		c.Dashboard.LedgerFile = v
+	}
+	// WB2A_PUSHPLUS_TOKEN：非空时覆盖推送 token（secrets 走 env 比写进 config 更稳）。
+	// 注意本模式与既有 env 一致（非空才生效）；且**不**自动打开 enabled——
+	// 开关仍归配置文件显式表达，避免「注入了 token 就悄悄开始推送」。
+	if v := os.Getenv("WB2A_PUSHPLUS_TOKEN"); v != "" {
+		c.Notify.Token = v
 	}
 	if v := os.Getenv("WB2A_MAX_BODY_MB"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil {
@@ -271,6 +336,15 @@ func (c *Config) normalize() error {
 	// 大请求又被静默 413——不如 fail fast 提示显式配大上限。
 	if c.Server.MaxBodyMB <= 0 {
 		return fmt.Errorf("server.max_body_mb: %d 非法（需为正整数，单位 MB）", c.Server.MaxBodyMB)
+	}
+	// dashboard.refresh_seconds <= 0 回落默认 10（面板自动刷新间隔，非安全敏感，宽进）。
+	if c.Dashboard.RefreshSeconds <= 0 {
+		c.Dashboard.RefreshSeconds = 10
+	}
+	// notify.cooldown_hours <= 0 回落默认 6（告警重推冷却，非安全敏感，宽进）。
+	// 阈值 <=0 保留原样：那是「显式关闭该项检查」的语义，与这里的宽进不同。
+	if c.Notify.CooldownHours <= 0 {
+		c.Notify.CooldownHours = 6
 	}
 	if c.SoftRateDur, err = time.ParseDuration(c.Cooldown.SoftRate); err != nil {
 		return fmt.Errorf("cooldown.soft_rate: %w", err)
