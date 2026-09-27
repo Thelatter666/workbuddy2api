@@ -1,0 +1,663 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>WorkBuddy2API 用量看板</title>
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --panel2:#1c2230; --line:#2a3240;
+    --fg:#e6edf3; --muted:#8b949e; --accent:#58a6ff; --green:#3fb950;
+    --red:#f85149; --yellow:#d29922; --purple:#bc8cff; --cyan:#39c5cf;
+    --pink:#f778ba; --orange:#ffa657;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);
+    font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+  .wrap{max-width:1360px;margin:0 auto;padding:20px 16px 60px}
+  header{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:16px}
+  header h1{font-size:18px;margin:0;font-weight:600}
+  .badge{font-size:12px;padding:2px 8px;border-radius:999px;background:var(--panel2);
+    color:var(--muted);border:1px solid var(--line);white-space:nowrap}
+  .spacer{flex:1}
+  .keybox{display:flex;gap:6px;align-items:center}
+  input,button,select{font:inherit}
+  input[type=password]{background:var(--panel);border:1px solid var(--line);color:var(--fg);
+    border-radius:6px;padding:5px 9px;width:200px}
+  button{background:var(--panel2);border:1px solid var(--line);color:var(--fg);
+    border-radius:6px;padding:5px 12px;cursor:pointer}
+  button:hover{border-color:var(--accent)}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(168px,1fr));gap:12px;margin-bottom:16px}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:13px 14px}
+  .card .label{color:var(--muted);font-size:12px;margin-bottom:5px}
+  .card .value{font-size:21px;font-weight:600;font-variant-numeric:tabular-nums;line-height:1.25}
+  .card .sub{color:var(--muted);font-size:12px;margin-top:3px}
+  .card.hl{border-color:#2f4d76;background:linear-gradient(180deg,#16233a,#161b22)}
+  .card.warn .value{color:var(--yellow)}
+  .card.bad .value{color:var(--red)}
+  .panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;
+    padding:16px;margin-bottom:16px}
+  .panel h2{font-size:14px;margin:0 0 12px;font-weight:600;display:flex;align-items:center;
+    gap:10px;flex-wrap:wrap}
+  .panel h2 .legend{margin-left:auto;display:flex;gap:14px;font-weight:400;font-size:12px;
+    flex-wrap:wrap;color:var(--muted)}
+  .dot{display:inline-block;width:8px;height:8px;border-radius:50%;margin-right:5px;vertical-align:middle}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{text-align:left;padding:7px 9px;border-bottom:1px solid var(--line);white-space:nowrap}
+  th{color:var(--muted);font-weight:500;font-size:12px}
+  td.num,th.num{text-align:right;font-variant-numeric:tabular-nums}
+  tr:last-child td{border-bottom:none}
+  .tbl-wrap{overflow-x:auto}
+  .pill{font-size:11px;padding:1px 7px;border-radius:999px;border:1px solid var(--line);color:var(--muted)}
+  .pill.ok{color:var(--green);border-color:#1d3a24}
+  .pill.cool{color:var(--yellow);border-color:#3d3418}
+  .pill.off{color:var(--red);border-color:#3d1d1d}
+  .muted{color:var(--muted)}
+  .tabs{display:flex;gap:6px;flex-wrap:wrap}
+  .tabs button{padding:3px 10px;font-size:12px}
+  .tabs button.on{background:var(--accent);border-color:var(--accent);color:#03121f;font-weight:600}
+  svg{display:block;width:100%;height:auto}
+  .err{background:#2d1418;border:1px solid #5a2226;color:#ff9d96;padding:10px 14px;
+    border-radius:8px;margin-bottom:14px;display:none}
+  .note{color:var(--muted);font-size:12px;margin-top:10px}
+  .bar{height:6px;border-radius:3px;background:var(--panel2);overflow:hidden;min-width:60px}
+  .bar > i{display:block;height:100%;background:var(--accent)}
+  .foot{color:var(--muted);font-size:12px;text-align:center;margin-top:24px;line-height:1.8}
+  @media (max-width:640px){
+    .cards{grid-template-columns:repeat(auto-fit,minmax(142px,1fr))}
+    .card .value{font-size:18px}
+    .panel{padding:12px}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>WorkBuddy2API 用量看板</h1>
+    <span class="badge" id="svc">—</span>
+    <span class="badge" id="uptime">—</span>
+    <div class="spacer"></div>
+    <form class="keybox" id="keybox" style="display:none" autocomplete="off">
+      <input type="password" id="key" placeholder="API Key（Bearer）" autocomplete="off">
+      <button type="submit" id="save">保存</button>
+    </form>
+    <button id="csv" title="导出当前区间的逐日数据">导出 CSV</button>
+    <button id="refresh">刷新</button>
+  </header>
+
+  <div class="err" id="err"></div>
+
+  <div class="panel" style="padding:12px 16px">
+    <div class="tabs" id="range">
+      <button data-days="7">近 7 天</button>
+      <button data-days="30" class="on">近 30 天</button>
+      <button data-days="90">近 90 天</button>
+      <button data-days="180">近 180 天</button>
+      <button data-days="365">近 1 年</button>
+      <button data-days="1095">全部</button>
+    </div>
+  </div>
+
+  <div class="cards" id="cards"></div>
+
+  <div class="panel">
+    <h2>积分消耗
+      <span class="legend">
+        <span><span class="dot" style="background:var(--yellow)"></span>每日消耗</span>
+        <span><span class="dot" style="background:var(--accent)"></span>累计消耗（右轴）</span>
+      </span>
+    </h2>
+    <div id="creditTrend"></div>
+  </div>
+
+  <div class="panel">
+    <h2>各账号积分消耗
+      <span class="legend" id="acctLegend"></span>
+    </h2>
+    <div id="creditByAcct"></div>
+  </div>
+
+  <div class="panel">
+    <h2>账号积分余额
+      <span class="legend"><span>每日收盘余额（低位由签到回补，故呈锯齿下降）</span></span>
+    </h2>
+    <div id="balanceTrend"></div>
+  </div>
+
+  <div class="panel">
+    <h2>请求与 Tokens
+      <span class="legend">
+        <span><span class="dot" style="background:var(--accent)"></span>请求数</span>
+        <span><span class="dot" style="background:var(--purple)"></span>Tokens(千)</span>
+      </span>
+      <span class="tabs">
+        <button id="tg24" class="on">24 小时</button>
+        <button id="tg7d">7 天</button>
+      </span>
+    </h2>
+    <div id="trend"></div>
+  </div>
+
+  <div class="panel">
+    <h2>账号状态</h2>
+    <div class="tbl-wrap"><table id="accounts"></table></div>
+    <div class="note" id="acctNote"></div>
+  </div>
+
+  <div class="panel">
+    <h2>模型用量排行<span class="legend"><span>进程累计 + 窗口内 credit 占比</span></span></h2>
+    <div class="tbl-wrap"><table id="models"></table></div>
+  </div>
+
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const KEY_STORE = 'wb2a_dashboard_key';
+const PALETTE = ['#58a6ff','#3fb950','#d29922','#bc8cff','#39c5cf','#ffa657','#f778ba','#7ee787'];
+let timer = null, hoursMode = 24, rangeDays = 30, payload = null;
+
+/* ---------- 格式化 ---------- */
+function fmtN(n){
+  n = Number(n)||0;
+  if (Math.abs(n) >= 1e9) return (n/1e9).toFixed(2)+'B';
+  if (Math.abs(n) >= 1e6) return (n/1e6).toFixed(2)+'M';
+  if (Math.abs(n) >= 1e3) return (n/1e3).toFixed(1)+'k';
+  return String(Math.round(n*100)/100);
+}
+function fmtCredit(n){ return (Number(n)||0).toFixed(2).replace(/\.00$/,''); }
+function fmtInt(n){ return (Number(n)||0).toLocaleString('en-US'); }
+// fmtAxis 图表坐标轴刻度：按量级统一精度，避免 1.578 / 0.789 这类原始浮点。
+function fmtAxis(v){
+  v = Number(v)||0;
+  if (Math.abs(v) >= 1e6) return (v/1e6).toFixed(2)+'M';
+  if (Math.abs(v) >= 1e3) return (v/1e3).toFixed(1)+'k';
+  if (Math.abs(v) >= 100) return v.toFixed(0);
+  if (Math.abs(v) >= 10)  return v.toFixed(1);
+  return v.toFixed(2);
+}
+function esc(s){ return String(s??'').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c])); }
+function since(iso){
+  const t = Date.parse(iso);
+  // 零值时间（0001-01-01，未见成功/错误）与解析失败一律显示 "—"，不能算成天文数字天龄。
+  if (isNaN(t) || t < Date.parse('2000-01-01')) return '—';
+  const d = Math.floor((Date.now()-t)/1000);
+  if (d < 0) return '刚刚';
+  if (d < 60) return d+'s 前';
+  if (d < 3600) return Math.floor(d/60)+'m 前';
+  if (d < 86400) return Math.floor(d/3600)+'h 前';
+  return Math.floor(d/86400)+'d 前';
+}
+function shortUID(u){ return (!u||u==='-') ? '—' : u.slice(0,8); }
+function sumOf(arr){ return (arr||[]).reduce((a,b)=>a+(Number(b)||0),0); }
+// observedDays 台账实际观测到的天数（Since → 最后一天）。
+// 刚部署时大量「窗口里的日子」其实没有数据；把它们当零消耗摊进去，
+// 会让 7 日日均被稀释成真实值的几分之一，"预计可用天数"随之虚高好几倍。
+function observedDays(lt, n){
+  if (!lt || !lt.since || !lt.dates || !lt.dates.length) return 0;
+  const from = Date.parse(lt.since+'T00:00:00Z');
+  const last = Date.parse(lt.dates[lt.dates.length-1]+'T00:00:00Z');
+  if (isNaN(from) || isNaN(last)) return 0;
+  const cov = Math.round((last-from)/86400000) + 1;
+  return Math.max(1, Math.min(n, cov));
+}
+// avgOf 窗口内日均：按自然日摊分（「预计可用天数」问的是日历天——一周只用 3 天
+// 余额自然撑得更久），但分母只算真正观测到的天数，见 observedDays。
+function avgOf(arr, n, den){
+  if (!arr || !arr.length) return 0;
+  const seg = arr.slice(Math.max(0, arr.length - n));
+  return sumOf(seg) / Math.max(1, Math.min(den || seg.length, seg.length));
+}
+
+/* ---------- 聚合：长区间降采样，避免几百根柱子挤在一起 ---------- */
+function bucketStep(n){ return n <= 120 ? 1 : Math.ceil(n / 90); }
+// labelOf 轴标签：窗口跨度大（含跨年）时必须带年份，否则「9/27」在 3 年视图里指代不明。
+function labelOf(dateStr, step, longSpan){
+  const [y,m,d] = dateStr.split('-');
+  if (longSpan || step >= 28) return y.slice(2)+'/'+m;   // 23/09 —— 年月
+  return Number(m)+'/'+Number(d);
+}
+// aggregate 把逐日序列按 step 天求和；余额取桶内最后一个非空值（余额不是流量，不能求和）。
+function aggregate(lt, step){
+  const n = lt.dates.length;
+  // 超过约 13 个月的窗口一律标年月：三种长期图共用这套标签，避免各图口径不一。
+  const longSpan = n > 400;
+  const agg = {labels:[], tip:[], requests:[], tokens:[], credit:[], accounts:{}, balances:{}};
+  for (const uid in (lt.accounts||{})){
+    agg.accounts[uid] = [];
+    agg.balances[uid] = [];
+  }
+  for (let i = 0; i < n; i += step){
+    const end = Math.min(n, i + step) - 1;
+    agg.labels.push(labelOf(lt.dates[i], step, longSpan));
+    agg.tip.push(step > 1 ? lt.dates[i]+' ~ '+lt.dates[end] : lt.dates[i]);
+    agg.requests.push(sumOf(lt.requests.slice(i, end+1)));
+    agg.tokens.push(sumOf(lt.tokens.slice(i, end+1)));
+    agg.credit.push(sumOf(lt.credit.slice(i, end+1)));
+    for (const uid in agg.accounts){
+      const src = lt.accounts[uid] || {};
+      agg.accounts[uid].push(sumOf((src.credit||[]).slice(i, end+1)));
+      const bal = src.balance || [];
+      let last = null;
+      for (let k = i; k <= end; k++) if (bal[k] !== null && bal[k] !== undefined) last = bal[k];
+      agg.balances[uid].push(last);
+    }
+  }
+  return agg;
+}
+
+/* ---------- SVG 图表 ---------- */
+// CH 随视口切换：SVG 是 viewBox 等比缩放，若窄屏仍用 1140 宽，轴文字会被缩到看不清。
+// 窄屏改用接近实际像素宽度的 viewBox + 更大字号，牺牲横向密度换可读性。
+let CH = {W:1140, H:250, pad:{l:60, r:58, t:18, b:30}, fs:11};
+function syncChartSize(){
+  const narrow = window.innerWidth < 700;
+  CH = narrow
+    ? {W:460, H:270, pad:{l:42, r:38, t:16, b:30}, fs:13}
+    : {W:1140, H:250, pad:{l:60, r:58, t:18, b:30}, fs:11};
+}
+// frame 画网格与左右轴，返回左右轴的坐标映射（maxRight=0 时不画右轴）。
+function frame(maxLeft, maxRight, leftLabel, rightLabel){
+  const {W,H,pad} = CH, pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  const mL = Math.max(maxLeft||0, 1e-9), mR = Math.max(maxRight||0, 1e-9);
+  const yL = v => pad.t + ph - ph*(v/mL);
+  const yR = v => pad.t + ph - ph*(v/mR);
+  let g = '';
+  for (let i = 0; i <= 4; i++){
+    const yy = pad.t + ph*i/4;
+    g += `<line x1="${pad.l}" y1="${yy}" x2="${W-pad.r}" y2="${yy}" stroke="#232b38" stroke-width="1"/>`
+       + `<text x="${pad.l-8}" y="${yy+4}" fill="#8b949e" font-size="${CH.fs}" text-anchor="end">${fmtAxis(mL*(1-i/4))}</text>`;
+    if (maxRight) g += `<text x="${W-pad.r+8}" y="${yy+4}" fill="#6e7681" font-size="${CH.fs}">${fmtAxis(mR*(1-i/4))}</text>`;
+  }
+  if (leftLabel) g += `<text x="${pad.l-8}" y="${pad.t-5}" fill="#8b949e" font-size="${CH.fs}" text-anchor="end">${esc(leftLabel)}</text>`;
+  if (rightLabel && maxRight) g += `<text x="${W-pad.r+8}" y="${pad.t-5}" fill="#6e7681" font-size="${CH.fs}">${esc(rightLabel)}</text>`;
+  return {g, yL, yR};
+}
+function xTicks(labels){
+  const {W,H,pad} = CH, pw = W-pad.l-pad.r;
+  const step = Math.max(1, Math.ceil(labels.length / (CH.W < 700 ? 5 : 10)));
+  let g = '';
+  for (let i = 0; i < labels.length; i++){
+    if (i % step) continue;
+    const x = pad.l + pw*(i+0.5)/labels.length;
+    g += `<text x="${x.toFixed(1)}" y="${H-8}" fill="#8b949e" font-size="${CH.fs}" text-anchor="middle">${esc(labels[i])}</text>`;
+  }
+  return g;
+}
+function svgWrap(g){ return `<svg viewBox="0 0 ${CH.W} ${CH.H}" preserveAspectRatio="xMidYMid meet">${g}</svg>`; }
+
+// comboChart 柱（左轴）+ 折线（右轴）：每日消耗 + 累计消耗。
+function comboChart(labels, tips, bars, line){
+  const maxBar = Math.max(1, ...bars.filter(v=>v>0));
+  const maxLine = Math.max(1, ...line);
+  const f = frame(maxBar, maxLine, '每日', '累计');
+  const {pad} = CH, pw = CH.W-pad.l-pad.r, ph = CH.H-pad.t-pad.b;
+  const slot = pw/Math.max(1, labels.length), bw = Math.max(1.5, Math.min(56, slot*0.62));
+  let g = f.g;
+  bars.forEach((v,i)=>{
+    if (v <= 0) return;
+    const cx = pad.l + slot*(i+0.5), h = Math.max(1, ph - (f.yL(v)-pad.t));
+    g += `<rect x="${(cx-bw/2).toFixed(1)}" y="${(pad.t+ph-h).toFixed(1)}" width="${bw.toFixed(1)}" height="${h.toFixed(1)}" fill="#d29922" rx="1.5" opacity="0.85">`
+       + `<title>${esc(tips[i])} 每日消耗: ${fmtCredit(v)} credit</title></rect>`;
+  });
+  const px = i => (pad.l + slot*(i+0.5)).toFixed(1);
+  g += `<path d="${line.map((v,i)=>`${i?'L':'M'}${px(i)},${f.yR(v).toFixed(1)}`).join('')}" fill="none" stroke="#58a6ff" stroke-width="2" stroke-linejoin="round"/>`;
+  line.forEach((v,i)=>{
+    g += `<circle cx="${px(i)}" cy="${f.yR(v).toFixed(1)}" r="2.6" fill="#58a6ff">`
+       + `<title>${esc(tips[i])} 累计: ${fmtCredit(v)} credit</title></circle>`;
+  });
+  g += xTicks(labels);
+  return svgWrap(g);
+}
+
+// stackedChart 堆叠柱：各账号每桶积分消耗。
+function stackedChart(labels, tips, series){
+  const totals = labels.map((_,i)=>series.reduce((a,s)=>a+(s.values[i]||0),0));
+  const f = frame(Math.max(1, ...totals), 0, 'credit', '');
+  const {pad} = CH, pw = CH.W-pad.l-pad.r, ph = CH.H-pad.t-pad.b;
+  const slot = pw/Math.max(1, labels.length), bw = Math.max(1.5, Math.min(64, slot*0.8));
+  let g = f.g;
+  totals.forEach((_,i)=>{
+    const cx = pad.l + slot*(i+0.5);
+    let acc = 0;
+    series.forEach(s=>{
+      const v = s.values[i]||0;
+      if (v <= 0) return;
+      const y0 = f.yL(acc), y1 = f.yL(acc+v);
+      acc += v;
+      g += `<rect x="${(cx-bw/2).toFixed(1)}" y="${y1.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(1,(y0-y1)).toFixed(1)}" fill="${s.color}" rx="1">`
+         + `<title>${esc(tips[i])} ${esc(s.name)}: ${fmtCredit(v)} credit</title></rect>`;
+    });
+  });
+  g += xTicks(labels);
+  return svgWrap(g);
+}
+
+// multiLine 多折线（余额）：null 处断线——缺失不该拿 0 冒充。
+function multiLine(labels, tips, series){
+  const vals = series.flatMap(s=>s.values.filter(v=>v!==null&&v!==undefined));
+  if (!vals.length) return '<div class="muted">暂无余额快照</div>';
+  let min = Math.min(...vals), max = Math.max(...vals);
+  const span = (max - min) || Math.max(1, max*0.1);
+  min = Math.max(0, min - span*0.15); max = max + span*0.1;
+  const {pad} = CH, pw = CH.W-pad.l-pad.r, ph = CH.H-pad.t-pad.b;
+  const y = v => pad.t + ph - ph*((v-min)/((max-min)||1));
+  const slot = pw/Math.max(1, labels.length);
+  let g = '';
+  for (let i = 0; i <= 4; i++){
+    const yy = pad.t + ph*i/4;
+    g += `<line x1="${pad.l}" y1="${yy}" x2="${CH.W-pad.r}" y2="${yy}" stroke="#232b38" stroke-width="1"/>`
+       + `<text x="${pad.l-8}" y="${yy+4}" fill="#8b949e" font-size="${CH.fs}" text-anchor="end">${fmtAxis(min+(max-min)*(1-i/4))}</text>`;
+  }
+  series.forEach(s=>{
+    let d = '', open = false;
+    s.values.forEach((v,i)=>{
+      if (v === null || v === undefined){ open = false; return; }
+      d += (open ? 'L' : 'M') + (pad.l + slot*(i+0.5)).toFixed(1) + ',' + y(v).toFixed(1);
+      open = true;
+    });
+    g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`;
+    s.values.forEach((v,i)=>{
+      if (v === null || v === undefined) return;
+      g += `<circle cx="${(pad.l+slot*(i+0.5)).toFixed(1)}" cy="${y(v).toFixed(1)}" r="2.2" fill="${s.color}">`
+         + `<title>${esc(tips[i])} ${esc(s.name)}: ${fmtInt(v)} 积分</title></circle>`;
+    });
+  });
+  g += xTicks(labels);
+  return svgWrap(g);
+}
+
+// lineChart 时间点等距的折线（小时趋势用）。
+function lineChart(points, series){
+  const max = Math.max(1, ...series.flatMap(s => points.map(p => s.get(p))));
+  const {W,H,pad} = CH, pw = W-pad.l-pad.r, ph = H-pad.t-pad.b;
+  const f = frame(max, 0, '', '');
+  const x = i => pad.l + (points.length<=1 ? pw/2 : pw*i/(points.length-1));
+  let g = f.g;
+  const step = Math.max(1, Math.ceil(points.length/(CH.W < 700 ? 4 : 8)));
+  points.forEach((p,i)=>{
+    if (i%step) return;
+    g += `<text x="${x(i)}" y="${H-8}" fill="#8b949e" font-size="${CH.fs}" text-anchor="middle">${esc(p.label)}</text>`;
+  });
+  series.forEach(s=>{
+    const d = points.map((p,i)=>`${i?'L':'M'}${x(i).toFixed(1)},${f.yL(s.get(p)).toFixed(1)}`).join('');
+    g += `<path d="${d}" fill="none" stroke="${s.color}" stroke-width="2" stroke-linejoin="round"/>`;
+    points.forEach((p,i)=>{
+      g += `<circle cx="${x(i).toFixed(1)}" cy="${f.yL(s.get(p)).toFixed(1)}" r="2.4" fill="${s.color}">`
+         + `<title>${esc(p.label)} ${s.name}: ${fmtN(s.get(p))}</title></circle>`;
+    });
+  });
+  return svgWrap(g);
+}
+
+function hourLabel(iso){
+  const d = new Date(iso);
+  return ((d.getMonth()+1)+'/'+d.getDate()+' '+String(d.getHours()).padStart(2,'0')+':00');
+}
+function dayLabel(iso){
+  const d = new Date(iso);
+  return (d.getMonth()+1)+'/'+d.getDate();
+}
+
+// windowView 把长期序列裁到最近 n 天。请求窗口固定兜底 30 天（近 7/30 日卡片要用），
+// 若不裁，选「近 7 天」时图表仍会画 30 天——用户选的区间必须真的生效。
+function windowView(lt, n){
+  if (!lt.dates || !lt.dates.length || lt.dates.length <= n) return lt;
+  const cut = a => (a ? a.slice(-n) : a);
+  const accounts = {};
+  for (const u in (lt.accounts||{})){
+    const a = lt.accounts[u];
+    accounts[u] = {requests: cut(a.requests), credit: cut(a.credit), balance: cut(a.balance)};
+  }
+  const models = {};
+  for (const k in (lt.models||{})){
+    const mm = lt.models[k];
+    models[k] = {requests: cut(mm.requests), credit: cut(mm.credit)};
+  }
+  return Object.assign({}, lt, {
+    dates: cut(lt.dates), requests: cut(lt.requests), tokens: cut(lt.tokens), credit: cut(lt.credit),
+    accounts, models,
+  });
+}
+
+/* ---------- 渲染 ---------- */
+function render(data){
+  payload = data;
+  syncChartSize();
+  const st = data.status || {};
+  const m  = data.metrics || {};
+  const total = m.total || {};
+  const accs = st.accounts || [];
+  const ltAll = m.long_term || {dates:[],requests:[],tokens:[],credit:[],accounts:{},models:{}};
+  const lt = windowView(ltAll, rangeDays);   // 图表/表格只看所选区间
+  const ltK = ltAll;                          // 卡片里的近 7/30 日需要更长窗口
+  const nick = {}, colorOf = {};
+  accs.forEach((a,i) => {
+    nick[a.uid] = a.nickname || shortUID(a.uid);
+    colorOf[a.uid] = PALETTE[i % PALETTE.length];
+  });
+  const colorFor = uid => colorOf[uid] || PALETTE[Object.keys(colorOf).length % PALETTE.length];
+
+  const credits = accs.reduce((a,x)=>a+(x.credits||0),0);
+  const dailyAll = ltK.credit || [], reqAll = ltK.requests || [];
+  const daily = lt.credit || [], dailyReq = lt.requests || [];
+  const sumLast = (arr,d) => sumOf(arr.slice(Math.max(0, arr.length - d)));
+  const todayCredit = dailyAll.length ? dailyAll[dailyAll.length-1] : 0;
+  const todayReq = reqAll.length ? reqAll[reqAll.length-1] : 0;
+  const cr7 = sumLast(dailyAll, 7), cr30 = sumLast(dailyAll, 30), crWin = sumOf(daily);
+  const obs7 = observedDays(ltK, 7), obs30 = observedDays(ltK, 30);
+  const avg7 = avgOf(dailyAll, 7, obs7) || avgOf(dailyAll, 30, obs30);
+  const daysLeft = (credits > 0 && avg7 > 0) ? credits/avg7 : null;
+
+  $('#svc').textContent = data.service || 'workbuddy2api';
+  const up = m.uptime_sec||0;
+  $('#uptime').textContent = '运行 '+(up>=86400?Math.floor(up/86400)+'d ':'')+
+    (up>=3600?Math.floor(up%86400/3600)+'h ':'')+Math.floor(up%3600/60)+'m';
+
+  const cards = [
+    ['剩余积分', fmtInt(credits), accs.length+' 个账号合计', 'hl'],
+    ['今日消耗', fmtCredit(todayCredit), '今日请求 '+fmtInt(todayReq), ''],
+    ['近 7 日消耗', fmtCredit(cr7), '日均 '+fmtCredit(avgOf(dailyAll,7,obs7))+'（观测 '+Math.min(obs7,7)+' 天）· 请求 '+fmtN(sumLast(reqAll,7)), ''],
+    ['近 30 日消耗', fmtCredit(cr30), '日均 '+fmtCredit(avgOf(dailyAll,30,obs30))+'（观测 '+Math.min(obs30,30)+' 天）· 请求 '+fmtN(sumLast(reqAll,30)), ''],
+    ['区间累计消耗', fmtCredit(crWin), lt.dates.length+' 天窗口 · 日均 '+fmtCredit(avgOf(daily, lt.dates.length, observedDays(lt, lt.dates.length))), ''],
+    ['预计可用天数', daysLeft===null ? '—' : Math.floor(daysLeft)+' 天',
+      daysLeft===null ? '余额或消耗为 0，无法估算' : '按近 7 日日均 '+fmtCredit(avg7)+'/天（观测 '+Math.min(obs7,7)+' 天）',
+      daysLeft===null ? '' : (daysLeft < 7 ? 'bad' : (daysLeft < 30 ? 'warn' : ''))],
+    ['窗口 Tokens', fmtN(sumOf(lt.tokens||[])), '请求 '+fmtN(sumOf(dailyReq))+' 次', ''],
+    ['进程累计', fmtN(total.requests)+' 次', '失败 '+fmtN(total.fail)+' · 成功率 '+
+      (total.requests? (total.ok*100/total.requests).toFixed(1)+'%' : '—'), ''],
+  ];
+  $('#cards').innerHTML = cards.map(c =>
+    `<div class="card ${c[3]}"><div class="label">${esc(c[0])}</div><div class="value">${esc(c[1])}</div><div class="sub">${esc(c[2])}</div></div>`
+  ).join('');
+
+  // 长期三图共用同一套分桶
+  const step = bucketStep(lt.dates.length);
+  const agg = aggregate(lt, step);
+  let cum = 0;
+  const cumArr = agg.credit.map(v => (cum += v));
+
+  $('#creditTrend').innerHTML = lt.dates.length
+    ? comboChart(agg.labels, agg.tip, agg.credit, cumArr)
+    : '<div class="muted">暂无数据</div>';
+
+  const acctOrder = Object.keys(agg.accounts)
+    .map(uid => ({uid, sum: sumOf(agg.accounts[uid])}))
+    .filter(x => x.sum > 0)
+    .sort((a,b) => b.sum - a.sum);
+  const acctSeries = acctOrder.map(x => ({name: nick[x.uid] || shortUID(x.uid), color: colorFor(x.uid), values: agg.accounts[x.uid]}));
+  $('#acctLegend').innerHTML = acctSeries.map(s =>
+    `<span><span class="dot" style="background:${s.color}"></span>${esc(s.name)}</span>`).join('') || '';
+  $('#creditByAcct').innerHTML = (lt.dates.length && acctSeries.length)
+    ? stackedChart(agg.labels, agg.tip, acctSeries)
+    : '<div class="muted">暂无数据</div>';
+
+  const balSeries = Object.keys(agg.balances)
+    .filter(uid => agg.balances[uid].some(v => v !== null && v !== undefined))
+    .map(uid => ({name: nick[uid] || shortUID(uid), color: colorFor(uid), values: agg.balances[uid]}));
+  $('#balanceTrend').innerHTML = balSeries.length
+    ? multiLine(agg.labels, agg.tip, balSeries)
+    : '<div class="muted">暂无余额快照（余额曲线从本次部署起逐日累积）</div>';
+
+  const hrs = (m.hours||[]).slice();
+  const pts = (hoursMode===24 ? hrs.slice(-24) : hrs);
+  const tpts = pts.map(p => ({label: hoursMode===24 ? hourLabel(p.ts) : dayLabel(p.ts), r:p.requests, t:p.tokens/1000}));
+  $('#trend').innerHTML = tpts.length
+    ? lineChart(tpts, [{name:'请求数', color:'#58a6ff', get:p=>p.r}, {name:'Tokens(千)', color:'#bc8cff', get:p=>p.t}])
+    : '<div class="muted">暂无数据</div>';
+
+  const rows = accs.map(a => {
+    const dim = (lt.accounts||{})[a.uid] || {};
+    const cr = dim.credit || [], bal = dim.balance || [], rq = dim.requests || [];
+    const winCredit = sumOf(cr), todayC = cr.length ? cr[cr.length-1] : 0;
+    const avg = avgOf(cr, Math.min(30, cr.length), Math.min(30, obs30));
+    const left = (avg > 0 && a.credits > 0) ? Math.floor(a.credits/avg) : null;
+    let first = null, last = null;
+    for (const v of bal){ if (v !== null && v !== undefined){ if (first === null) first = v; last = v; } }
+    const delta = (first !== null && last !== null) ? last - first : null;
+    let state = '<span class="pill ok">正常</span>';
+    if (a.disabled) state = '<span class="pill off">已禁用</span>';
+    else if (a.cooling) state = '<span class="pill cool">冷却中</span>';
+    else if (a.in_flight > 0) state = '<span class="pill">在途 '+a.in_flight+'</span>';
+    const rl = (a.rate_limited_models||[]).map(r=>esc(r.model)).join(', ') || '—';
+    return `<tr>
+      <td><span class="dot" style="background:${colorFor(a.uid)}"></span>${esc(a.nickname||shortUID(a.uid))}
+        <div class="muted" style="font-size:11px">${esc(shortUID(a.uid))} · ${esc(a.realm||'cn')}</div></td>
+      <td class="num">${fmtInt(a.credits)}</td>
+      <td class="num">${delta===null?'—':(delta>0?'+':'')+fmtN(delta)}</td>
+      <td class="num">${fmtCredit(todayC)}</td>
+      <td class="num">${fmtCredit(winCredit)}</td>
+      <td class="num">${avg?fmtCredit(avg):'—'}</td>
+      <td class="num">${left===null?'—':left+' 天'}</td>
+      <td class="num">${fmtN(sumOf(rq))}</td>
+      <td class="num">${fmtN(a.success_count)}</td>
+      <td>${state}</td>
+      <td class="muted">${esc(since(a.last_success))}</td>
+      <td class="muted">${rl}</td>
+    </tr>`;
+  }).join('');
+  $('#accounts').innerHTML = accs.length ? `<thead><tr>
+      <th>账号</th><th class="num">余额</th><th class="num">窗口变化</th><th class="num">今日消耗</th>
+      <th class="num">窗口消耗</th><th class="num">日均消耗</th><th class="num">预计可用</th>
+      <th class="num">窗口请求</th><th class="num">累计成功</th>
+      <th>状态</th><th>最近成功</th><th>模型限流</th>
+    </tr></thead><tbody>${rows}</tbody>` : '<tbody><tr><td class="muted">无账号</td></tr></tbody>';
+  $('#acctNote').textContent = accs.length
+    ? '「窗口变化」= 区间内余额首末差（含签到回补，故通常小于消耗）；「日均消耗」按所选区间（最长 30 天）自然日摊分；「预计可用」= 余额 ÷ 该日均。'
+      + (window.innerWidth < 700 ? ' 表格可左右滑动查看全部列。' : '')
+    : '';
+
+  // 模型排行：窗口维度为主（跨重启连续），进程累计作为补充列。
+  // 只按进程累计排的话，每次重启后这里是空的——长期看板上不可接受。
+  const tm = m.top_models || [];
+  const modelCredit = {}, modelReq = {};
+  for (const k in (lt.models||{})){
+    modelCredit[k] = sumOf(lt.models[k].credit);
+    modelReq[k] = sumOf(lt.models[k].requests);
+  }
+  const lifeOf = {};
+  tm.forEach(x => lifeOf[x.model] = x);
+  const allModels = [...new Set([...Object.keys(modelCredit), ...tm.map(x=>x.model)])]
+    .sort((a,b) => (modelCredit[b]||0)-(modelCredit[a]||0)
+                || (modelReq[b]||0)-(modelReq[a]||0)
+                || (lifeOf[b]?.requests||0)-(lifeOf[a]?.requests||0));
+  const maxMC = Math.max(1, ...Object.values(modelCredit), 1);
+  $('#models').innerHTML = allModels.length ? `<thead><tr>
+      <th>模型</th><th class="num">窗口请求</th><th class="num">窗口 Credit</th><th>占比</th>
+      <th class="num">进程请求</th><th class="num">进程 Credit</th><th class="num">失败</th>
+    </tr></thead><tbody>${allModels.map(name=>{
+      const mc = modelCredit[name], lf = lifeOf[name];
+      return `<tr><td>${esc(name)}</td>
+        <td class="num">${modelReq[name]===undefined?'—':fmtN(modelReq[name])}</td>
+        <td class="num">${mc===undefined?'—':fmtCredit(mc)}</td>
+        <td style="min-width:90px">${mc===undefined?'<span class="muted">—</span>'
+          :`<div class="bar"><i style="width:${(mc/maxMC*100).toFixed(0)}%"></i></div>`}</td>
+        <td class="num">${lf?fmtN(lf.requests):'0'}</td>
+        <td class="num">${lf?fmtCredit(lf.credit):'0'}</td>
+        <td class="num">${lf?fmtN(lf.fail):'0'}</td></tr>`;
+    }).join('')}</tbody>` : '<tbody><tr><td class="muted">暂无数据</td></tr></tbody>';
+
+  // 页脚如实说明保留策略与实际覆盖：开着落盘却说清零就是撒谎。
+  const cov = lt.coverage_days || 0;
+  const hotNote = data.metrics_persistent ? '热数据（小时 7 天 / 日 30 天）跨重启保留' : '热数据仅内存（重启即丢）';
+  const ledgerNote = data.ledger_persistent
+    ? `长期台账已落盘（上限 ${lt.ledger_days||0} 天，已覆盖 ${cov} 天${lt.since?'，自 '+lt.since+' 起':''}）`
+    : '长期台账未落盘（dashboard.ledger_file 为空）：重启后长期序列会清空';
+  $('#foot').innerHTML = '数据更新于 '+(m.generated_at?new Date(m.generated_at).toLocaleString():'—')
+    +' · '+esc(hotNote)+' · '+esc(ledgerNote)
+    +'<br>credit 只统计上游返回 usage.credit 的请求（免费模型计 0）；余额为每日收盘快照，低位跳升来自签到回补。';
+}
+
+/* ---------- 导出 CSV ---------- */
+function exportCSV(){
+  const lt = payload?.metrics?.long_term;
+  if (!lt || !lt.dates || !lt.dates.length){ showErr('暂无可导出的数据'); return; }
+  const nick = {}; (payload.status?.accounts||[]).forEach(a => nick[a.uid] = a.nickname || shortUID(a.uid));
+  const uids = Object.keys(lt.accounts||{});
+  const head = ['date','requests','tokens','credit',
+    ...uids.map(u => 'credit_'+(nick[u]||shortUID(u))),
+    ...uids.map(u => 'balance_'+(nick[u]||shortUID(u)))];
+  const lines = [head.join(',')];
+  for (let i = 0; i < lt.dates.length; i++){
+    const row = [lt.dates[i], lt.requests[i]||0, lt.tokens[i]||0, (lt.credit[i]||0).toFixed(4)];
+    for (const u of uids) row.push(((lt.accounts[u].credit||[])[i]||0).toFixed(4));
+    for (const u of uids){
+      const b = (lt.accounts[u].balance||[])[i];
+      row.push(b === null || b === undefined ? '' : b);
+    }
+    lines.push(row.join(','));
+  }
+  const blob = new Blob(['\ufeff'+lines.join('\n')], {type:'text/csv;charset=utf-8'});
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `wb2api-usage-${lt.dates[0]}_${lt.dates[lt.dates.length-1]}.csv`;
+  a.click();
+  URL.revokeObjectURL(a.href);
+}
+
+/* ---------- 取数与定时器 ---------- */
+async function load(){
+  const key = localStorage.getItem(KEY_STORE) || '';
+  const h = key ? {'Authorization':'Bearer '+key} : {};
+  // 短窗口 KPI（近 7/30 日）需要至少 30 天数据，故请求窗口取两者较大值。
+  const days = Math.max(rangeDays, 30);
+  try{
+    const r = await fetch('api/dashboard?days='+days, {headers:h});
+    if (r.status === 401){ showKey(true); showErr('API Key 无效或缺失，请在上方填写后保存。'); return; }
+    if (!r.ok){ showErr('请求失败：HTTP '+r.status); return; }
+    const data = await r.json();
+    showErr(null); showKey(data.auth_required && !key);
+    render(data);
+    if (timer) clearInterval(timer);
+    // 长区间载荷大（几百天平行数组），刷新放慢，避免长期开着面板空耗流量。
+    const secs = Math.max(3, data.refresh_seconds||10) * (rangeDays > 90 ? 6 : 1);
+    timer = setInterval(load, secs*1000);
+  }catch(e){ showErr('无法连接到网关：'+e.message); }
+}
+function showErr(m){ const el=$('#err'); el.style.display = m?'block':'none'; el.textContent = m||''; }
+// 视口变化（转屏 / 改窗口）后重画：图表尺寸与刻度是按视口算的，不重画就会用旧比例。
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => { if (payload) render(payload); }, 200);
+});
+function showKey(v){ $('#keybox').style.display = v?'flex':'none'; }
+
+$('#keybox').addEventListener('submit', e => { e.preventDefault(); localStorage.setItem(KEY_STORE, $('#key').value.trim()); load(); });
+$('#refresh').onclick = load;
+$('#csv').onclick = exportCSV;
+$('#tg24').onclick = ()=>{ hoursMode=24; $('#tg24').classList.add('on'); $('#tg7d').classList.remove('on'); if (payload) render(payload); };
+$('#tg7d').onclick = ()=>{ hoursMode=168; $('#tg7d').classList.add('on'); $('#tg24').classList.remove('on'); if (payload) render(payload); };
+$('#range').addEventListener('click', e => {
+  const btn = e.target.closest('button[data-days]');
+  if (!btn) return;
+  rangeDays = Number(btn.dataset.days);
+  [...$('#range').children].forEach(b => b.classList.toggle('on', b === btn));
+  load();
+});
+$('#key').value = localStorage.getItem(KEY_STORE) || '';
+load();
+</script>
+</body>
+</html>

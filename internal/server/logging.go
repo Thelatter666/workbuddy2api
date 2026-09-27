@@ -10,6 +10,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"time"
+
+	"workbuddy2api/internal/metrics"
 )
 
 // chatSeq 进程级请求序号。
@@ -28,6 +30,11 @@ type chatStat struct {
 	ttfb   time.Duration
 	toks   int // <0 表示 usage 缺失 → 显示 "-"
 	status int
+
+	// 以下字段仅供 metrics 采集（统计面板），不影响日志行格式。
+	promptToks int     // prompt tokens（0 = 未取到）
+	credit     float64 // 本次真实扣费
+	hasCredit  bool    // usage.credit 是否显式出现（缺失 ≠ 0）
 
 	logged bool
 }
@@ -48,6 +55,23 @@ func (s *chatStat) done() {
 	}
 	s.logged = true
 	logChatRow(s.ttfb, time.Since(s.start), s.model, s.mode, s.uid, s.status, s.toks)
+}
+
+// toSample 把 chatStat 投影为 metrics 采集样本（统计面板用）。
+// toks 的 -1 哨兵在 metrics 侧钳 0，故此处原样传递。
+func (s *chatStat) toSample() metrics.Sample {
+	return metrics.Sample{
+		Start:        s.start,
+		Model:        s.model,
+		Mode:         s.mode,
+		UID:          s.uid,
+		Status:       s.status,
+		Tokens:       s.toks,
+		PromptTokens: s.promptToks,
+		Credit:       s.credit,
+		HasCredit:    s.hasCredit,
+		TTFB:         s.ttfb,
+	}
 }
 
 // chatStatsReader 在流式透传时抓取 SSE 末帧的 usage.completion_tokens 精确值，

@@ -15,6 +15,7 @@ import (
 
 	"workbuddy2api/internal/auth"
 	"workbuddy2api/internal/logfmt"
+	"workbuddy2api/internal/metrics"
 	"workbuddy2api/internal/pool"
 	"workbuddy2api/internal/prompt"
 	"workbuddy2api/internal/session"
@@ -49,6 +50,16 @@ type Config struct {
 	// false（显式逃生门）时即便 auth realm=global 也不提供 global: 模型名
 	// （modelList 不列 global 名单）。
 	GlobalEnabled bool
+
+	// Metrics 请求统计采集器（统计面板数据源）；nil = 不采集（测试与关闭面板时）。
+	// 与既有 chatStat 日志共用同一出口，nil 时零开销、零行为变化。
+	Metrics *metrics.Collector
+	// DashboardEnabled 是否注册 /dashboard 与 /api/dashboard 路由。
+	// 缺省 false（Config 零值）→ 测试与未显式开启的部署零回归。
+	DashboardEnabled bool
+	// DashboardRefreshSeconds 面板自动刷新间隔（秒），供 /api/dashboard 透出；
+	// <=0 时兜底 10（见 NewHandler）。
+	DashboardRefreshSeconds int
 }
 
 // notFoundCooldown 上游 404 的固定短冷却时长。
@@ -86,11 +97,19 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxBodyBytes <= 0 {
 		cfg.MaxBodyBytes = 8 << 20 // 请求体上限兜底 8MB
 	}
+	if cfg.DashboardRefreshSeconds <= 0 {
+		cfg.DashboardRefreshSeconds = 10
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux()}
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("GET /v1/models", h.withAuth(h.models))
 	h.mux.HandleFunc("GET /status", h.withAuth(h.status))
 	h.mux.HandleFunc("GET /healthz", h.healthz)
+	if cfg.DashboardEnabled {
+		// 面板外壳公开（不含数据），数据端点 /api/dashboard 与 /status 同鉴权口径。
+		h.mux.HandleFunc("GET /dashboard", h.dashboardPage)
+		h.mux.HandleFunc("GET /api/dashboard", h.withAuth(h.dashboardAPI))
+	}
 	return h
 }
 
@@ -128,9 +147,9 @@ func (h *Handler) healthz(w http.ResponseWriter, r *http.Request) {
 	// 恒无鉴权（负载均衡/编排探活只需 2xx/503 语义），身份靠 service 字段 + X-Service 头双保险。
 	w.Header().Set("X-Service", ServiceName)
 	writeJSON(w, status, map[string]any{
-		"healthy":       healthy,
-		"total":         total,
-		"service":       ServiceName,
+		"healthy":        healthy,
+		"total":          total,
+		"service":        ServiceName,
 		"realm_servable": realmServable,
 	})
 }
@@ -148,12 +167,12 @@ func (h *Handler) status(w http.ResponseWriter, r *http.Request) {
 	// realm_totals 按域分组的计数汇总（双 realm 并存时运维一眼看到各域可用性）：
 	// 只新增字段，既有 total/healthy/cooling/disabled/in_flight_full 汇总键不变（零回归）。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"accounts":        h.cfg.Pool.List(),
-		"total":           total,
-		"healthy":         healthy,
-		"cooling":         cooling,
-		"disabled":        disabled,
-		"in_flight_full":  inFlightFull,
+		"accounts":       h.cfg.Pool.List(),
+		"total":          total,
+		"healthy":        healthy,
+		"cooling":        cooling,
+		"disabled":       disabled,
+		"in_flight_full": inFlightFull,
 		"realm_totals": map[string]map[string]int{
 			"cn":     countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("cn")),
 			"global": countsMapFrom(h.cfg.Pool.CountsDetailedForRealm("global")),
@@ -379,7 +398,14 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	// 请求级统计：出口即打一行表格日志（任何路径都会走到）。
 	st := newChatStat(time.Now(), body, peek.Stream)
-	defer st.done()
+	// 日志 + 统计面板采集共用同一出口：defer 覆盖全部 return/break，无遗漏。
+	// 413/读体失败发生在 st 创建之前（客户端问题），不计入面板。
+	defer func() {
+		st.done()
+		if h.cfg.Metrics != nil {
+			h.cfg.Metrics.Record(st.toSample())
+		}
+	}()
 
 	tried := map[string]bool{}
 	var lastErr error
@@ -598,10 +624,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			_ = upstream.Stream(w, stats)
 			st.ttfb = stats.TTFB()
 			st.toks, _ = stats.Tokens()
+			if total := stats.TotalTokens(); total > 0 {
+				st.promptToks = total - st.toks // TotalTokens = prompt + completion
+			}
 			// 成本账本：末帧 usage 带 credit 与 token 总数时记录实测单价，
 			// 供下次选号把免费/便宜的号排在前面。
 			if credit, ok := stats.Credit(); ok {
 				h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, stats.TotalTokens())
+				// 面板采集：同一观测同时喂给统计面板（缺失≠0，仅显式 credit 计入）。
+				st.credit, st.hasCredit = credit, true
 			} else if _, hasUsage := stats.Tokens(); hasUsage {
 				// R9(c) 防护观测：usage 存在但 credit 缺失（如 global SSE 末帧未带 credit）。
 				// 不算合法成本观测（缺失≠0），仅记一条 WARN 协助排障，绝不写入账本。
@@ -624,6 +655,15 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 成本账本（非流式）：从聚合响应的 usage 取 credit 与 token 总数。
 		if credit, total, ok := usageCreditTotal(resp); ok {
 			h.cfg.Pool.NoteModelCost(acct.UID, bareModel, credit, total)
+			// 面板采集：同上，仅显式出现的 credit 计入。
+			st.credit, st.hasCredit = credit, true
+			comp := st.toks
+			if comp < 0 {
+				comp = 0 // usage 缺 completion 但含 prompt 时，余量即 prompt
+			}
+			if total > comp {
+				st.promptToks = total - comp
+			}
 		}
 		return
 	}
