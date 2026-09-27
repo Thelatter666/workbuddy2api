@@ -79,6 +79,21 @@ WorkBuddy2API 是一个自托管的 **OpenAI 兼容反向代理网关**，将 ``
 - 领养联动 / 任务查询：`scripts/task_runner.py`（成长任务一体机，默认 dry-run）
 - 个性化提示词：`prompt.file` 指向自定义提示词文件即整体替换内置默认
 
+### 服务托管（macOS launchd，可选）
+
+非 Docker 部署可用 launchd 托管，实现**开机自启 + 崩溃自动重启**：
+
+```bash
+go build -o wb2api ./cmd/server
+bash scripts/install_launchd.sh              # 安装并启动（会先停掉手动实例）
+launchctl print gui/$(id -u)/com.user.wb2api # 查看状态
+bash scripts/install_launchd.sh --uninstall  # 停止并卸载
+```
+
+- 配置模板：`deploy/launchd/com.user.wb2api.plist`（`KeepAlive=true` 无条件常驻；`RunAtLoad` 开机自启；日志落 `data/wb2api.{out,err}.log`）
+- **要停服必须用 `launchctl bootout gui/$(id -u)/com.user.wb2api`** 或上面 `--uninstall` —— `KeepAlive=true` 下直接 `kill` 会被立即拉起
+- 与 Docker 路线**二选一**：两者绑同一端口与同一 `./data`，不能同时运行
+
 ## 架构总览
 
 ```mermaid

@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  workbuddy2api LaunchAgent 模板（macOS 开机自启 + 崩溃自动重启）。
+
+  本文件是模板，仓库路径占位符由 scripts/install_launchd.sh 替换为绝对路径后，
+  安装到 ~/Library/LaunchAgents/com.user.wb2api.plist。请勿直接 cp 到 LaunchAgents
+  （占位符不会被替换，launchd 会因路径不存在而无法启动）。
+
+  常用操作：
+    安装/重装   bash scripts/install_launchd.sh
+    查看状态    launchctl print gui/$(id -u)/com.user.wb2api
+    停止并卸载  launchctl bootout gui/$(id -u)/com.user.wb2api
+    重新加载    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.user.wb2api.plist
+
+  注意：KeepAlive=true 是无条件常驻——直接 kill 掉进程会被 launchd 立即拉起。
+  要真正停住必须先 bootout（见上）。
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wb2api</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__REPO__/wb2api</string>
+        <string>-config</string>
+        <string>__REPO__/config.json</string>
+    </array>
+
+    <!-- CWD 必须是仓库根：应用用相对路径读 ./auths 与 ./data/state.json，
+         否则会解析到 / 导致账号加载为空。 -->
+    <key>WorkingDirectory</key>
+    <string>__REPO__</string>
+
+    <!-- 登录/加载时立即启动，且重启后自动拉起。 -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- 无条件常驻：无论正常退出还是崩溃，launchd 都会拉起。
+         这是「网关永远在线」的语义；要手动停服需先 bootout。 -->
+    <key>KeepAlive</key>
+    <true/>
+
+    <!-- 两次拉起之间的最小间隔（秒），防崩溃循环刷屏。 -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <!-- launchd 不继承登录 shell 环境：
+         PATH 需含 python3 与 homebrew（scheduler 会 spawn scripts/*.py）；
+         TZ 固定 Asia/Shanghai，保证签到/旅行等定时任务的时刻正确。 -->
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/Library/Frameworks/Python.framework/Versions/Current/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string>
+        <key>TZ</key>
+        <string>Asia/Shanghai</string>
+    </dict>
+
+    <!-- 日志落仓库 data/：与手动运行时的重定向一致，便于对照排查。
+         注意 launchd 不做轮转，长期运行需自行清理。 -->
+    <key>StandardOutPath</key>
+    <string>__REPO__/data/wb2api.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>__REPO__/data/wb2api.err.log</string>
+</dict>
+</plist>
