@@ -455,8 +455,13 @@ func (p *Pool) rateLimitedModelsLocked(e *entry, now time.Time) []RateLimitedMod
 				Until:  mc.Until,
 				Reason: mc.Reason,
 			}
-			// 上游原始重置墙钟：截断后 until==resetAt 时省略（omitempty），台账只显示真实恢复时刻。
-			if !mc.ResetAt.IsZero() && !mc.ResetAt.Equal(mc.Until) {
+			// ResetAt：上游「将在 … 重置」的原始墙钟（未经 soft_rate_max 截断），
+			// 供运维按真实恢复时刻观察（issue #36）。有值就必须透出——早期实现用
+			// `!ResetAt.Equal(Until)` 想在未截断时省略一列，但 Until 由「第二次
+			// time.Now() + d」算出，与秒级 ResetAt 极易精确相等（实测 ~93%），
+			// 导致 reset_at 在未截断的常见情况下反而被 omitempty 吞成零值。
+			// 是否截断不是本层该判断的事：零值即省略，非零一律透出。
+			if !mc.ResetAt.IsZero() {
 				row.ResetAt = mc.ResetAt
 			}
 			rows = append(rows, row)
